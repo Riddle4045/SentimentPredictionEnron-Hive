@@ -1,0 +1,120 @@
+/** distribution of emails sent year wise */
+insert overwrite local directory '/home/hduser/Documents/temp/yearfrequency'
+select  dates , count(dates) as numEmails from 
+(select split(timestamp," ")[3] as dates , count(timestamp) 
+from enronset group by timestamp) mailfreq 
+group by dates 
+order by numEmails desc;
+
+/**  distribution of emails senders frequecy distribtuion */
+select  from_id , count(from_id) as counts  from enronset 
+group by from_id 
+order by counts desc limit 10;
+
+/* lets see who sent the maximum emails to whom */
+/** to achieve this we first make the to_id column array of strings , then explode those to create 
+from_id to_id count(1) pair for all the possible combinations 
+then we just group them by from_id , to_id  first to agregate unique sending entries seond grouping to agregate dupliatesaand wollaah! we are done ! */
+insert  overwrite local directory '/home/hduser/Documents/temp/onetoonefre'select from_id ,splitstring, count(1) as counts from enronset
+Lateral view explode(split(to_id,',')) mytable as splitstring  
+group by from_id , splitstring  
+order by counts desc;
+
+/* profiling jeff.dasovich@enron.com */
+insert  overwrite local directory '/home/hduser/Documents/temp/onetoonefreJeff'select from_id ,splitstring, count(1) as counts from enronset
+Lateral view explode(split(to_id,',')) mytable as splitstring where from_id="jeff.dasovich@enron.com" 
+group by from_id , splitstring  
+order by counts desc;
+
+/** frequency of emails sent by date */
+select  dates , count(dates) from 
+(select concat_ws(" " ,split(timestamp," ")[0],split(timestamp," ")[1],split(timestamp," ")[2],split(timestamp," ")[3]) as dates , count(timestamp) 
+from enronset 
+group by timestamp) mailfreq 
+group by dates;
+
+
+/* okay so lets get all the email exchanges from the year 2001 .. and first of all lets see who topped the sending charts in that year than we can analyaze the subjects and contexts to do some sentiment analysis */
+
+insert overwrite local directory '/home/hduser/Documents/temp/' select from_id, count(1) as counts from enronset where split(timestamp," ")[3] = 2001 group by from_id order by counts desc;
+
+/* this gives us the top culprits as 
+vince.kaminski@enron.com	4748
+pete.davis@enron.com	6470
+jeff.dasovich@enron.com	8087
+kay.mann@enron.com	8910
+vince.kaminski@enron.com	4748
+pete.davis@enron.com	6470
+jeff.dasovich@enron.com	8087
+kay.mann@enron.com	8910             */
+
+
+/* now lets  extract emails sent by vince.kaminski@enron.com during 2001 */
+insert overwrite local directory '/home/hduser/Documents/temp/1/' select from_id, context, to_id ,count(1) as counts from enronset where split(timestamp," ")[3] = 2001 and from_id="vince.kaminski@enron.com" group by from_id,context,to_id  order by counts desc;
+
+	
+/* creating a table to store the tagged values for the emails */
+create table if not exists vinceemails ( from_id string , to_id string, timestamp string context string , hashvalue int ) row format delimited fields terminated by "\t" stored as textfile;
+
+
+/* now lets tag the email bodies to identify the words  when exploded and store in a table for later sentiment anaylsis i.e join with the afinn table*/
+insert overwrite table vinceemails select distinct from_id,to_id,context, hash(from_id,to_id,length(context),split(timestamp," ")[4]) as identifier from  enronset where split(timestamp," ")[3] = 2001 and from_id="vince.kaminski@enron.com";
+
+
+/*   now  lets tag the email bodies to identify the words  when exploded and store in the directoy for bookkeeping */
+insert overwrite local directory '/home/hduser/Documents/temp/2'select distinct from_id,to_id,context, hash(from_id,to_id,length(context)) as identifier from  enronset where split(timestamp," ")[3] = 2001 and from_id="vince.kaminski@enron.com";
+
+
+/* now lets create a table for AFINN database*/
+create table afinn ( words string , sentiment int ) row format delimited fields terminated by "\t" stored as textfile;
+
+/** just a test query to see if explode works fine then we will run the stupid jon */
+insert overwrite local directory '/home/hduser/Documents/temp/exploded_view' select from_id , takers from test lateral view explode(to_id) myTable as takers;
+
+/*creating new table for the exploded view */
+create table if not exists vinceemailsexploded ( from_id string , to_id string , context array<string> , hashvalue int ) row format delimited fields terminated by "\t" stored as textfile;
+
+/* put the data in vinceemails with context split
+hive> describe vinceemails;
+OK
+from_id             	string              	None                
+to_id               	string              	None                
+context             	string              	None                
+hashvalue           	int                 	None                
+Time taken: 0.149 seconds, Fetched: 4 row(s)
+*/
+insert overwrite table vinceemails select distinct from_id,to_id,regexp_replace(context,"\\s+",","), hash(from_id,to_id,length(context),split(timestamp," ")[4]) as identifier from  enronset where split(timestamp," ")[3] = 2001 and from_id="vince.kaminski@enron.com";
+
+/** vinceemailswordssplits description
+from_id             	string              	None                
+to_id               	string              	None                
+context             	array<string>       	None                
+hashvvalue          	int                 	None     
+*/
+insert overwrite table vinceemailswordssplits select from_id, to_id,t, split(context,",") , hashvalue from vinceemails;
+
+/* lets create a table with a dummy value of 0 as an integer  this wil be the sentiment of the words when 
+we join with the afinn table .. then later on based on the group by of hash_value wel calculate the average and thats it we have the sentiment of the emails , so lets create the the table with the following entries*/
+/*
+hive> describe vincewordsexploded;
+OK
+from_id             	string              	None                
+to_id               	string              	None                
+word                	string              	None                
+hashvalue           	int                 	None                
+sentiment           	int                 	None                
+Time taken: 0.143 seconds, Fetched: 5 row(s)
+*/
+create table if not exists vincewordsexploded ( from_id string , to_id string , word string , hashvalue int , sentiment int ) row format delimited fields terminated by "\t";	
+
+insert overwrite table vincewordsexploded select from_id ,to_id ,viral ,hashvvalue, 0 from vinceemailswordssplits lateral view explode(context)  mytable as viral ;
+
+insert overwrite table sentiment select word,vincewordsexploded.sentiment + afinn.sentiment as total , hashvalue from vincewordsexploded join afinn on ( vincewordsexploded.word = afinn.words) ;
+
+insert overwrite local directory '/home/hduser/Documents/temp/sentiments'  select split(timestamp," ")[2] as mon, avg(sentiment) as avg  from sentiment group by split(timestamp," ")[2] ;
+
+insert overwrite local directory '/home/hduser/Documents/temp/sentiments'  select hashvalue,split(timestamp," ")[2] as mon, avg(sentiment) as avg  from sentiment group by hashvalue,split(timestamp," ")[2];
+
+
+
+
